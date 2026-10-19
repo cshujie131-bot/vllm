@@ -42,6 +42,8 @@ class MLAPrefillBackend(ABC):
         torch.bfloat16,
     ]
     supported_mla_dimensions: ClassVar[list[MLADimensions]] = []
+    # Non-CUDA custom backends can explicitly opt out of CUDA capability checks.
+    supports_missing_device_capability: ClassVar[bool] = False
 
     @staticmethod
     @abstractmethod
@@ -90,12 +92,15 @@ class MLAPrefillBackend(ABC):
     @classmethod
     def validate_configuration(
         cls,
-        device_capability: "DeviceCapability",
+        device_capability: "DeviceCapability | None",
         selector_config: "MLAPrefillSelectorConfig",
     ) -> list[str]:
         invalid_reasons: list[str] = []
 
-        if not cls.supports_compute_capability(device_capability):
+        if device_capability is None:
+            if not cls.supports_missing_device_capability:
+                invalid_reasons.append("device capability not available")
+        elif not cls.supports_compute_capability(device_capability):
             invalid_reasons.append(
                 f"compute capability {device_capability.major}."
                 f"{device_capability.minor} not supported"

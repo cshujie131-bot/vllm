@@ -83,6 +83,10 @@ class PPHandler:
         self.req_idx_gen_np = np.zeros(max_num_reqs, dtype=np.int32)
 
         # Dedicated subgroup for the sampled-token broadcast.
+        self._init_broadcast_transport()
+
+    def _init_broadcast_transport(self) -> None:
+        """Create the sampled-token transport; subclasses may supply a backend."""
         self.broadcast_group = get_pp_group().make_sibling_device_group(
             group_desc="pp_broadcast"
         )
@@ -115,13 +119,16 @@ class PPHandler:
             idx_mapping_np = np.where(exclude_mask, -1, slot.idx_mapping_np)
             idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
 
-        self.main_stream.wait_event(slot.event)
+        self._wait_for_recv(slot)
         return dict(
             sampled_tokens=slot.sampled_tokens,
             num_sampled=slot.num_sampled,
             num_rejected=slot.num_rejected,
             idx_mapping=idx_mapping,
         )
+
+    def _wait_for_recv(self, slot: PendingRecv) -> None:
+        self.main_stream.wait_event(slot.event)
 
     def receive(self, input_batch: InputBatch) -> bool:
         """Returns True iff sampled tokens need to be gathered from *all*

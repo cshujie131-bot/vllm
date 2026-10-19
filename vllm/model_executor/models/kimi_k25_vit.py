@@ -382,6 +382,9 @@ def _make_vision_norm(norm_type: str, hidden_dim: int) -> nn.Module:
 class MoonViTEncoderLayer(nn.Module):
     """Single encoder layer for MoonViT with TP/DP support."""
 
+    mlp_cls = MLP2
+    rotary_embedding = staticmethod(apply_rope)
+
     def __init__(
         self,
         num_heads: int,
@@ -415,7 +418,7 @@ class MoonViTEncoderLayer(nn.Module):
         self.norm1 = _make_vision_norm(norm_type, hidden_dim)
         if mlp_type != "mlp2":
             raise NotImplementedError(f"Not support mlp_type: {mlp_type}")
-        self.mlp = MLP2(
+        self.mlp = self.mlp_cls(
             [hidden_dim, mlp_dim, hidden_dim],
             activation,
             bias=linear_bias,
@@ -474,7 +477,7 @@ class MoonViTEncoderLayer(nn.Module):
         xqkv = xqkv.view(*qkv_shape)
         xq, xk, xv = torch.unbind(xqkv, dim=-3)
 
-        xq, xk = apply_rope(xq, xk, rope_freqs_cis)
+        xq, xk = self.rotary_embedding(xq, xk, rope_freqs_cis)
 
         if max_seqlen is None:
             max_seqlen = (cu_seqlens[1:] - cu_seqlens[:-1]).max()
@@ -525,6 +528,9 @@ class MoonViTEncoderLayer(nn.Module):
 class MoonViT3dEncoder(nn.Module):
     """Full encoder stack for MoonViT 3D."""
 
+    rope_cls = Rope2DPosEmbRepeated
+    encoder_layer_cls = MoonViTEncoderLayer
+
     def __init__(
         self,
         hidden_dim: int,
@@ -541,12 +547,12 @@ class MoonViT3dEncoder(nn.Module):
         )
         self.video_attn_type = video_attn_type
         qkv_hidden_size = block_cfg.get("qkv_hidden_size") or block_cfg["hidden_dim"]
-        self.rope_2d = Rope2DPosEmbRepeated(
+        self.rope_2d = self.rope_cls(
             qkv_hidden_size // block_cfg["num_heads"], 512, 512
         )
         self.blocks = nn.ModuleList(
             [
-                MoonViTEncoderLayer(
+                self.encoder_layer_cls(
                     **block_cfg,
                     quant_config=quant_config,
                     prefix=f"{prefix}.blocks.{layer_idx}",
@@ -706,6 +712,8 @@ class MoonViT3dPretrainedModel(nn.Module):
     Uses KimiK25VisionConfig directly from transformers_utils/configs/kimi_k25.py.
     """
 
+    encoder_cls = MoonViT3dEncoder
+
     def __init__(
         self,
         config: KimiK25VisionConfig,
@@ -732,7 +740,7 @@ class MoonViT3dPretrainedModel(nn.Module):
             ),
         )
 
-        self.encoder = MoonViT3dEncoder(
+        self.encoder = self.encoder_cls(
             hidden_dim=config.hidden_size,
             num_layers=config.num_hidden_layers,
             block_cfg={

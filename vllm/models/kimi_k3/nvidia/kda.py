@@ -277,6 +277,14 @@ def _make_decode_norm_weight_loader(
 
 
 class KimiK3DeltaAttention(GatedDeltaNetAttention):
+    @staticmethod
+    def _get_chunk_prefill_backend() -> Callable:
+        from vllm.models.kimi_k3.nvidia.ops.third_party.kda import (
+            chunk_kda_with_fused_gate,
+        )
+
+        return chunk_kda_with_fused_gate
+
     def get_attn_backend(self) -> type[AttentionBackend]:
         return KimiK3KDAAttentionBackend
 
@@ -485,6 +493,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
         if prefix in compilation_config.static_forward_context:
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
+        self._chunk_prefill = self._get_chunk_prefill_backend()
 
     def forward(
         self,
@@ -544,7 +553,6 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
             return
 
         from vllm.models.kimi_k3.nvidia.ops.third_party.kda import (
-            chunk_kda_with_fused_gate,
             fused_recurrent_kda,
             fused_recurrent_kda_packed_decode,
         )
@@ -751,7 +759,7 @@ class KimiK3DeltaAttention(GatedDeltaNetAttention):
                     (
                         core_attn_out_non_spec,
                         last_recurrent_state,
-                    ) = chunk_kda_with_fused_gate(
+                    ) = self._chunk_prefill(
                         q=q_ns,
                         k=k_ns,
                         v=v_ns,

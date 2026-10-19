@@ -108,7 +108,11 @@ def get_mla_prefill_backend(
     from vllm.platforms import current_platform
 
     device_capability = current_platform.get_device_capability()
-    if device_capability is None:
+    if (
+        device_capability is None
+        and vllm_config.attention_config.mla_prefill_backend
+        is not MLAPrefillBackendEnum.CUSTOM
+    ):
         logger.info_once(
             "Device capability not available, using FlashAttention MLA prefill backend."
         )

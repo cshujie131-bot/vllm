@@ -23,7 +23,11 @@ from vllm.distributed.parallel_state import (
     graph_capture,
     is_global_first_rank,
 )
-from vllm.forward_context import BatchDescriptor, set_forward_context
+from vllm.forward_context import (
+    BatchDescriptor,
+    get_forward_context,
+    set_forward_context,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.offloader.base import get_offloader
 from vllm.platforms import current_platform
@@ -544,6 +548,13 @@ class ModelCudaGraphManager(CudaGraphManager):
                     batch_descriptor=batch_descriptor,
                     is_padding=input_buffers.is_padding[:num_tokens],
                 ):
+                    # The capture manager intentionally passes inner mode NONE.
+                    # This per-forward hint also selects the path during warmup.
+                    context = get_forward_context()
+                    context.additional_kwargs = {
+                        **context.additional_kwargs,
+                        "cudagraph_capture_mode": desc.cg_mode.name,
+                    }
                     if cg_mode == CUDAGraphMode.PIECEWISE:
                         # PIECEWISE graph (compiled PW or breakable, chosen inside
                         # run_pw_graph).

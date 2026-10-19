@@ -3,7 +3,8 @@
 """Kimi-K3 multimodal model implementation for vLLM."""
 
 import math
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from typing import Any, cast
 
 import torch
@@ -32,6 +33,7 @@ from vllm.model_executor.layers.fused_moe.router.grouped_topk_router import (
 )
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     ReplicatedLinear,
     RowParallelLinear,
@@ -203,6 +205,9 @@ class KimiMLP(nn.Module):
     block still ends with one collective per direction.
     """
 
+    gate_up_projection_cls = MergedColumnParallelLinear
+    situ_activation_cls = SituAndMul
+
     def __init__(
         self,
         hidden_size: int,
@@ -228,7 +233,7 @@ class KimiMLP(nn.Module):
         self.run_gemm_rs = self.shard_sequence_parallel and run_gemm_rs
         replicate = use_sequence_parallel and not self.shard_sequence_parallel
 
-        self.gate_up_proj = MergedColumnParallelLinear(
+        self.gate_up_proj = self.gate_up_projection_cls(
             hidden_size,
             [intermediate_size] * 2,
             bias=False,
@@ -259,7 +264,7 @@ class KimiMLP(nn.Module):
         if hidden_act == "silu":
             self.act_fn = SiluAndMul()
         elif hidden_act == "situ":
-            self.act_fn = SituAndMul(
+            self.act_fn = self.situ_activation_cls(
                 beta=activation_situ_beta or 1.0,
                 linear_beta=activation_situ_linear_beta,
             )
@@ -296,7 +301,7 @@ class KimiRoutedOutputTransform(nn.Module):
     def __init__(
         self,
         norm: RMSNorm | None,
-        up_proj: ReplicatedLinear,
+        up_proj: ReplicatedLinear | ColumnParallelLinear,
     ) -> None:
         super().__init__()
         self.norm = norm
@@ -513,7 +518,34 @@ def make_kimi_k3_mega_moe_expert_params_mapping(
     return mapping
 
 
+@dataclass(frozen=True)
+class LatentMoEComponents:
+    """Construction choices for latent projections and their shared reduction."""
+
+    down_projection: Callable[..., ReplicatedLinear | ColumnParallelLinear] = (
+        ReplicatedLinear
+    )
+    up_projection: Callable[..., ReplicatedLinear | ColumnParallelLinear] = (
+        ReplicatedLinear
+    )
+    runner_cls: type[LatentMoERunner] = LatentMoERunner
+    shard_shared_experts: bool = False
+    overlap_down_projection: bool = True
+
+
 class KimiMoE(nn.Module):
+    shared_expert_cls = KimiMLP
+
+    def _get_latent_moe_components(
+        self, quant_config: QuantizationConfig | None, use_sequence_parallel: bool
+    ) -> LatentMoEComponents:
+        return LatentMoEComponents()
+
+    def _get_expert_partition_alignment(
+        self, config: KimiLinearConfig, quant_config: QuantizationConfig | None
+    ) -> int:
+        return getattr(config, "min_moe_intermediate_per_partition", 256)
+
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -569,8 +601,11 @@ class KimiMoE(nn.Module):
                 "Kimi K3 MegaMoE currently requires one expert group."
             )
         self.padded_moe_intermediate_size = moe_intermediate_size
-        min_moe_intermediate_per_partition = getattr(
-            config, "min_moe_intermediate_per_partition", 256
+        components = self._get_latent_moe_components(
+            quant_config, use_sequence_parallel
+        )
+        min_moe_intermediate_per_partition = self._get_expert_partition_alignment(
+            config, quant_config
         )
         if self.tp_size > 1 and not vllm_config.parallel_config.enable_expert_parallel:
             moe_intermediate_per_partition = moe_intermediate_size // self.tp_size
@@ -600,7 +635,7 @@ class KimiMoE(nn.Module):
 
         if self.num_shared_experts is not None:
             shared_intermediate_size = moe_intermediate_size * self.num_shared_experts
-            self.shared_experts = KimiMLP(
+            self.shared_experts = self.shared_expert_cls(
                 hidden_size=config.hidden_size,
                 intermediate_size=shared_intermediate_size,
                 hidden_act=config.hidden_act,
@@ -610,7 +645,9 @@ class KimiMoE(nn.Module):
                 # Only the MegaMoE path calls the shared experts directly; the
                 # FusedMoE path below hands them to the runner, which fuses
                 # their reduction and assumes the replicated layout.
-                can_shard_sequence_parallel=self.use_mega_moe,
+                can_shard_sequence_parallel=(
+                    self.use_mega_moe or components.shard_shared_experts
+                ),
                 run_gemm_rs=run_gemm_rs,
                 prefix=f"{prefix}.shared_experts",
                 activation_situ_beta=activation_situ_beta,
@@ -619,12 +656,12 @@ class KimiMoE(nn.Module):
         else:
             self.shared_experts = None
 
-        self.routed_expert_down_proj: ReplicatedLinear | None
+        self.routed_expert_down_proj: ReplicatedLinear | ColumnParallelLinear | None
         self.routed_expert_norm: RMSNorm | None
-        self.routed_expert_up_proj: ReplicatedLinear | None
+        self.routed_expert_up_proj: ReplicatedLinear | ColumnParallelLinear | None
         self.routed_output_transform: KimiRoutedOutputTransform | None
         if self.use_latent_moe:
-            self.routed_expert_down_proj = ReplicatedLinear(
+            self.routed_expert_down_proj = components.down_projection(
                 hidden_size,
                 self.moe_hidden_size,
                 bias=False,
@@ -641,7 +678,7 @@ class KimiMoE(nn.Module):
             # fuse the latent and shared reductions into a single all-reduce
             # (concat the two partials, reduce once), then run the up-proj and
             # shared add locally with no further collective.
-            self.routed_expert_up_proj = ReplicatedLinear(
+            self.routed_expert_up_proj = components.up_projection(
                 self.moe_hidden_size,
                 hidden_size,
                 bias=False,
@@ -655,7 +692,9 @@ class KimiMoE(nn.Module):
             # Auxiliary CUDA stream to overlap the router gate with the routed
             # down projection on decode-sized batches (gated by
             # _ROUTED_DOWN_PROJ_STREAM_TOKEN_THRESHOLD).
-            self._down_proj_stream: torch.cuda.Stream | None = aux_stream()
+            self._down_proj_stream: torch.cuda.Stream | None = (
+                aux_stream() if components.overlap_down_projection else None
+            )
             self._down_proj_events = (torch.cuda.Event(), torch.cuda.Event())
         else:
             self.routed_expert_down_proj = None
@@ -712,7 +751,7 @@ class KimiMoE(nn.Module):
                 routed_input_transform=None,
                 routed_output_transform=self.routed_output_transform,
                 is_sequence_parallel=use_sequence_parallel,
-                runner_cls=LatentMoERunner if self.use_latent_moe else None,
+                runner_cls=components.runner_cls if self.use_latent_moe else None,
             )
         if self.padded_moe_intermediate_size != moe_intermediate_size:
             w13_weight = getattr(self.experts, "w13_weight", None)
@@ -827,6 +866,19 @@ class KimiMoE(nn.Module):
 
 
 class KimiDecoderLayer(nn.Module):
+    delta_attention_cls = KimiK3DeltaAttention
+    mla_cls = MultiHeadLatentAttention
+    moe_cls = KimiMoE
+    mlp_cls = KimiMLP
+
+    def _select_sequence_parallel(self, parallel_config, use_mega_moe: bool) -> bool:
+        return (
+            parallel_config.pipeline_parallel_size == 1
+            and parallel_config.enable_expert_parallel
+            and parallel_config.tensor_parallel_size > 1
+            and (use_mega_moe or parallel_config.data_parallel_size > 1)
+        )
+
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -852,11 +904,8 @@ class KimiDecoderLayer(nn.Module):
         )
 
         use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
-        self.use_sequence_parallel = (
-            parallel_config.pipeline_parallel_size == 1
-            and parallel_config.enable_expert_parallel
-            and parallel_config.tensor_parallel_size > 1
-            and (use_mega_moe or parallel_config.data_parallel_size > 1)
+        self.use_sequence_parallel = self._select_sequence_parallel(
+            parallel_config, use_mega_moe
         )
         if config.is_kda_layer(layer_idx):
             kda_config = config.linear_attn_config
@@ -864,7 +913,7 @@ class KimiDecoderLayer(nn.Module):
             # This class also serves standalone Kimi-Linear through the model
             # registry. Only Kimi-K3's full-rank gate uses the private KDA path.
             if kda_config.get("use_full_rank_gate", False):
-                self.self_attn = KimiK3DeltaAttention(
+                self.self_attn = self.delta_attention_cls(
                     config,
                     vllm_config,
                     prefix=f"{prefix}.self_attn",
@@ -891,7 +940,7 @@ class KimiDecoderLayer(nn.Module):
             assert mla_use_nope, "Kimi-K3 MLA (MultiHeadLatentAttention) is NoPE-only"
             # q_lora_rank may be None (Kimi-Linear): the MLA layer then uses an
             # uncompressed q_proj instead of the fused q-LoRA front-end.
-            self.self_attn = MultiHeadLatentAttention(
+            self.self_attn = self.mla_cls(
                 config=config,
                 hidden_size=self.hidden_size,
                 num_heads=config.num_attention_heads,
@@ -913,7 +962,7 @@ class KimiDecoderLayer(nn.Module):
             self.self_attn.o_proj.reduce_results = False
 
         if self.is_moe_layer:
-            self.block_sparse_moe = KimiMoE(
+            self.block_sparse_moe = self.moe_cls(
                 config=config,
                 vllm_config=vllm_config,
                 quant_config=quant_config,
@@ -924,7 +973,7 @@ class KimiDecoderLayer(nn.Module):
             )
             self.mlp = self.block_sparse_moe
         else:
-            self.mlp = KimiMLP(
+            self.mlp = self.mlp_cls(
                 hidden_size=self.hidden_size,
                 intermediate_size=config.intermediate_size,
                 hidden_act=config.hidden_act,
@@ -1095,6 +1144,16 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         "fused_qkv_a_proj": ["q_a_proj", "kv_a_proj_with_mqa"],
     }
 
+    decoder_layer_cls = KimiDecoderLayer
+
+    def _select_sequence_parallel(self, parallel_config, use_mega_moe: bool) -> bool:
+        return (
+            parallel_config.pipeline_parallel_size == 1
+            and parallel_config.enable_expert_parallel
+            and parallel_config.tensor_parallel_size > 1
+            and (use_mega_moe or parallel_config.data_parallel_size > 1)
+        )
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -1104,11 +1163,8 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         self.use_attn_res = self.attn_res_block_size is not None
         parallel_config = vllm_config.parallel_config
         use_mega_moe = vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
-        self.use_sequence_parallel = (
-            parallel_config.pipeline_parallel_size == 1
-            and parallel_config.enable_expert_parallel
-            and parallel_config.tensor_parallel_size > 1
-            and (use_mega_moe or parallel_config.data_parallel_size > 1)
+        self.use_sequence_parallel = self._select_sequence_parallel(
+            parallel_config, use_mega_moe
         )
 
         self.vocab_size = config.vocab_size
@@ -1132,7 +1188,7 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
         aux_stream = torch.cuda.Stream()
 
         def get_layer(prefix: str):
-            return KimiDecoderLayer(
+            return self.decoder_layer_cls(
                 config,
                 vllm_config,
                 prefix,
@@ -1561,6 +1617,8 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
 class KimiLinearForCausalLM(
     nn.Module, HasInnerState, SupportsPP, MixtureOfExperts, IsHybrid, SupportsEagle3
 ):
+    model_cls = KimiLinearModel
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.model_config = vllm_config.model_config
@@ -1568,7 +1626,7 @@ class KimiLinearForCausalLM(
         self.config = self.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.quant_config = quant_config
-        self.model = KimiLinearModel(
+        self.model = self.model_cls(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
         if get_pp_group().is_last_rank:
@@ -1716,6 +1774,8 @@ class KimiK3ForConditionalGeneration(
             return "<|kimi_image_placeholder|>"
         raise ValueError(f"Unsupported modality: {modality}")
 
+    vision_tower_cls = MoonViT3dPretrainedModel
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -1737,7 +1797,7 @@ class KimiK3ForConditionalGeneration(
         self.device = current_platform.current_device()
 
         with self._mark_tower_model(vllm_config, "image"):
-            self.vision_tower = MoonViT3dPretrainedModel(
+            self.vision_tower = self.vision_tower_cls(
                 config.vision_config,
                 quant_config=self._maybe_ignore_quant_config(quant_config),
                 prefix=maybe_prefix(prefix, "vision_tower"),

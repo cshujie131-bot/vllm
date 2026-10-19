@@ -156,6 +156,9 @@ logger = init_logger(__name__)
 
 
 class GPUModelRunner(LoRAModelRunnerMixin):
+    pp_handler_cls = PPHandler
+    cudagraph_manager_cls = ModelCudaGraphManager
+
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         self.vllm_config = vllm_config
         self.model_config = vllm_config.model_config
@@ -289,7 +292,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             device=self.device,
         )
         if self.use_pp:
-            self.pp_handler = PPHandler(
+            self.pp_handler = self.pp_handler_cls(
                 max_num_reqs=self.max_num_reqs,
                 num_speculative_steps=self.num_speculative_steps,
                 device=self.device,
@@ -582,7 +585,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             kv_cache_config=self.kv_cache_config,
             max_num_reqs=self.max_num_reqs,
         )
-        self.cudagraph_manager = ModelCudaGraphManager(
+        self.cudagraph_manager = self.cudagraph_manager_cls(
             self.vllm_config,
             self.device,
             cudagraph_mode,
@@ -1404,6 +1407,28 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             self.ec_connector.no_forward(scheduler_output).ec_connector_output,
         )
 
+    def _prepare_intermediate_tensors(
+        self,
+        intermediate_tensors: IntermediateTensors,
+        num_tokens: int,
+        dummy_run: bool,
+    ) -> IntermediateTensors:
+        """Copy received PP inputs into persistent model buffers on this stream.
+
+        This method does not transfer ownership of caller-provided tensors.
+        Subclasses that own receive storage can release it after this returns.
+        """
+        assert self.intermediate_tensors is not None
+        tensors = {
+            key: value[:num_tokens]
+            if dummy_run
+            else value[:num_tokens].copy_(
+                intermediate_tensors.tensors[key][:num_tokens]
+            )
+            for key, value in self.intermediate_tensors.tensors.items()
+        }
+        return IntermediateTensors(tensors)
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1607,14 +1632,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Prepare the intermediate tensors.
             assert intermediate_tensors is not None
             assert self.intermediate_tensors is not None
-            n = input_batch.num_tokens_after_padding
-            new_tensors = {
-                k: v[:n]
-                if dummy_run
-                else v[:n].copy_(intermediate_tensors.tensors[k][:n])
-                for k, v in self.intermediate_tensors.tensors.items()
-            }
-            model_inputs["intermediate_tensors"] = IntermediateTensors(new_tensors)
+            model_inputs["intermediate_tensors"] = self._prepare_intermediate_tensors(
+                intermediate_tensors, input_batch.num_tokens_after_padding, dummy_run
+            )
             del intermediate_tensors
 
         # Update the EPLB meta.

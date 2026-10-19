@@ -117,6 +117,11 @@ def _gate_sigmoid_mul(attn_out: torch.Tensor, gate: torch.Tensor) -> torch.Tenso
 class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
     """Kimi-K3 Multi-head Latent Attention with optional RoPE and output gate."""
 
+    gate_projection_cls = ColumnParallelLinear
+
+    def _project_query(self, query: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return torch.bmm(query, weight)
+
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -245,7 +250,7 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
         # ---- Post-attention projections ----
         self.use_output_gate = use_output_gate
         self.g_proj = (
-            ColumnParallelLinear(
+            self.gate_projection_cls(
                 self.hidden_size,
                 self.num_heads * self.v_head_dim,
                 bias=False,
@@ -629,7 +634,9 @@ class MultiHeadLatentAttention(nn.Module, AttentionLayerBase):
                 [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
             )
             # BMM1: absorb q_nope into latent space. (N,B,P) x (N,P,L) -> (B,N,L)
-            ql_nope = torch.bmm(mqa_q_nope.transpose(0, 1), self.W_UK_T).transpose(0, 1)
+            ql_nope = self._project_query(
+                mqa_q_nope.transpose(0, 1), self.W_UK_T
+            ).transpose(0, 1)
             # Fused: concat mqa_q = [ql_nope | q_pe] and insert the decode-token
             # latent into the paged cache (one launch, right before forward_mqa).
             mqa_q = self._decode_concat_cache(

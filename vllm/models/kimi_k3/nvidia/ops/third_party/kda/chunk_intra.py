@@ -56,6 +56,7 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
     IS_VARLEN: tl.constexpr,
     USE_SAFE_GATE: tl.constexpr,
     SOLVE_TRIL_DOT_PRECISION: tl.constexpr,
+    DEFAULT_DOT_PRECISION: tl.constexpr = None,
 ):
     """
     Fused kernel: compute inter-subchunk Akk + solve_tril in one pass.
@@ -142,8 +143,8 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
             # [BK, BC]
             b_kgt = tl.trans(b_k0 * exp2(b_gn1[None, :] - b_g0))
             # [BC, BC]
-            b_Aqk10 += tl.dot(b_q1 * b_gqn, b_kgt)
-            b_Akk10 += tl.dot(b_k1 * b_gqn, b_kgt)
+            b_Aqk10 += tl.dot(b_q1 * b_gqn, b_kgt, input_precision=DEFAULT_DOT_PRECISION)
+            b_Akk10 += tl.dot(b_k1 * b_gqn, b_kgt, input_precision=DEFAULT_DOT_PRECISION)
 
             if i_tc2 < T:
                 p_q2 = tl.make_block_ptr(q, (T, K), (H*K, 1), (i_tc2, i_k * BK), (BC, BK), (1, 0))
@@ -161,13 +162,13 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
                 b_kg2 = b_k2 * b_gqn2
                 # [BK, BC]
                 b_kgt = tl.trans(b_k0 * exp2(b_gn2[None, :] - b_g0))
-                b_Aqk20 += tl.dot(b_qg2, b_kgt)
-                b_Akk20 += tl.dot(b_kg2, b_kgt)
+                b_Aqk20 += tl.dot(b_qg2, b_kgt, input_precision=DEFAULT_DOT_PRECISION)
+                b_Akk20 += tl.dot(b_kg2, b_kgt, input_precision=DEFAULT_DOT_PRECISION)
                 # [BC, BC]
                 b_kgt = tl.trans(b_k1 * exp2(b_gn2[None, :] - b_g1))
                 # [BC, BC]
-                b_Aqk21 += tl.dot(b_qg2, b_kgt)
-                b_Akk21 += tl.dot(b_kg2, b_kgt)
+                b_Aqk21 += tl.dot(b_qg2, b_kgt, input_precision=DEFAULT_DOT_PRECISION)
+                b_Akk21 += tl.dot(b_kg2, b_kgt, input_precision=DEFAULT_DOT_PRECISION)
 
                 if i_tc3 < T:
                     p_q3 = tl.make_block_ptr(q, (T, K), (H*K, 1), (i_tc3, i_k * BK), (BC, BK), (1, 0))
@@ -186,18 +187,18 @@ def chunk_kda_fwd_kernel_inter_solve_fused(
                     # [BK, BC]
                     b_kgt = tl.trans(b_k0 * exp2(b_gn3[None, :] - b_g0))
                     # [BC, BC]
-                    b_Aqk30 += tl.dot(b_qg3, b_kgt)
-                    b_Akk30 += tl.dot(b_kg3, b_kgt)
+                    b_Aqk30 += tl.dot(b_qg3, b_kgt, input_precision=DEFAULT_DOT_PRECISION)
+                    b_Akk30 += tl.dot(b_kg3, b_kgt, input_precision=DEFAULT_DOT_PRECISION)
                     # [BK, BC]
                     b_kgt = tl.trans(b_k1 * exp2(b_gn3[None, :] - b_g1))
                     # [BC, BC]
-                    b_Aqk31 += tl.dot(b_qg3, b_kgt)
-                    b_Akk31 += tl.dot(b_kg3, b_kgt)
+                    b_Aqk31 += tl.dot(b_qg3, b_kgt, input_precision=DEFAULT_DOT_PRECISION)
+                    b_Akk31 += tl.dot(b_kg3, b_kgt, input_precision=DEFAULT_DOT_PRECISION)
                     # [BK, BC]
                     b_kgt = tl.trans(b_k2 * exp2(b_gn3[None, :] - b_g2))
                     # [BC, BC]
-                    b_Aqk32 += tl.dot(b_qg3, b_kgt)
-                    b_Akk32 += tl.dot(b_kg3, b_kgt)
+                    b_Aqk32 += tl.dot(b_qg3, b_kgt, input_precision=DEFAULT_DOT_PRECISION)
+                    b_Akk32 += tl.dot(b_kg3, b_kgt, input_precision=DEFAULT_DOT_PRECISION)
 
     ################################################################################
     # save off-diagonal Aqk blocks and prepare Akk
@@ -380,6 +381,7 @@ def chunk_kda_fwd_kernel_intra_sub_chunk(
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_GATHER: tl.constexpr,
+    DEFAULT_DOT_PRECISION: tl.constexpr = None,
 ):
     i_t, i_i, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_hv = i_bh // HV, i_bh % HV
@@ -434,8 +436,8 @@ def chunk_kda_fwd_kernel_intra_sub_chunk(
 
     b_kgt = tl.trans(b_k * b_gk)
 
-    b_Aqk = tl.dot(b_q * b_gq, b_kgt) * scale
-    b_Akk = tl.dot(b_k * b_gq, b_kgt) * b_beta[:, None]
+    b_Aqk = tl.dot(b_q * b_gq, b_kgt, input_precision=DEFAULT_DOT_PRECISION) * scale
+    b_Akk = tl.dot(b_k * b_gq, b_kgt, input_precision=DEFAULT_DOT_PRECISION) * b_beta[:, None]
 
     o_i = tl.arange(0, BC)
     m_Aqk = o_i[:, None] >= o_i[None, :]

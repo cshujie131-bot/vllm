@@ -68,6 +68,7 @@ def recompute_w_u_fwd_kernel(
     STORE_KG: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     DOT_PRECISION: tl.constexpr,
+    DEFAULT_DOT_PRECISION: tl.constexpr = None,
 ):
     i_t, i_bh = tl.program_id(0), tl.program_id(1)
     i_b, i_h = i_bh // H, i_bh % H
@@ -183,7 +184,7 @@ def recompute_w_u_fwd_kernel(
             )
             tl.store(p_kg, b_kg.to(p_kg.dtype.element_ty), boundary_check=(0, 1))
 
-        b_w = tl.dot(b_A, b_kb.to(b_k.dtype))
+        b_w = tl.dot(b_A, b_kb.to(b_k.dtype), input_precision=DEFAULT_DOT_PRECISION)
         tl.store(p_w, b_w.to(p_w.dtype.element_ty), boundary_check=(0, 1))
 
 
@@ -264,6 +265,7 @@ def chunk_gla_fwd_kernel_o(
     BK: tl.constexpr,
     BV: tl.constexpr,
     IS_VARLEN: tl.constexpr,
+    DEFAULT_DOT_PRECISION: tl.constexpr = None,
 ):
     i_v, i_t, i_bh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_b, i_h = i_bh // H, i_bh % H
@@ -324,7 +326,7 @@ def chunk_gla_fwd_kernel_o(
         b_h = tl.load(p_h, boundary_check=(0, 1))
         # [BT, BV]
         if i_k >= 0:
-            b_o += tl.dot(b_qg, tl.trans(b_h).to(b_qg.dtype))
+            b_o += tl.dot(b_qg, tl.trans(b_h).to(b_qg.dtype), input_precision=DEFAULT_DOT_PRECISION)
     p_v = tl.make_block_ptr(
         v + (bos * H + i_h) * V,
         (T, V),

@@ -15,7 +15,11 @@ This source branch exposes the interfaces used by the accepted K3 plugin:
   communicator, queue and state filtering remain unchanged. FL implements the
   host-packed transport; this repository contains no K3 transport implementation.
 
-Nine existing Python files change. There is no request-scheduler algorithm
+- KDA kernels expose an optional dot-precision constexpr, defaulting to None.
+  FL selects its existing explicit IEEE policy through local tuning configs,
+  reusing the native kernel bodies without replacing library globals.
+
+Twelve existing Python files change. There is no request-scheduler algorithm
 change and no runtime source rewriting. The PP default AST matches the public
 base after inlining the two hooks; other interfaces retain the previously
 verified default-preserving changes. This fork is a pinned integration source,

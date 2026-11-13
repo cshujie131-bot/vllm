@@ -1161,6 +1161,9 @@ package_data = {
     "vllm": [
         "py.typed",
         "libs/*.so*",
+        "kernels/helion/configs/**/*.json",
+        "model_executor/layers/mamba/ops/configs/**/*.json",
+        "transformers_utils/chat_templates/*.jinja",
         "model_executor/layers/fused_moe/configs/*.json",
         "model_executor/layers/quantization/utils/configs/*.json",
         "entrypoints/serve/instrumentator/static/*.js",

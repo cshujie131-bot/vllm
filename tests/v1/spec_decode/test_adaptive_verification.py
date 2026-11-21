@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import pytest
+import torch
 
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionMetadataBuilder
@@ -13,6 +14,7 @@ from vllm.v1.worker.gpu.async_utils import StepTimingSample
 from vllm.v1.worker.gpu.spec_decode import adaptive_verification as adaptive_module
 from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     AdaptiveVerificationManager,
+    assign_draft_token_budget,
     maybe_create_adaptive_verification_manager,
     resolve_adaptive_cudagraph_mode,
 )
@@ -307,6 +309,68 @@ def test_zero_budget_rebuilds_cpu_cu_num_logits():
     assert cu_num_logits_np.dtype == scheduled_cu_num_logits.dtype
     # The prefill keeps its scheduled tokens; only drafts are dropped.
     assert np.array_equal(compacted, np.array([1, 1, 40], dtype=np.int32))
+
+
+def global_topk_budget(
+    confidence_probs: torch.Tensor,
+    idx_mapping: torch.Tensor,
+    capacities: torch.Tensor,
+    draft_budget: int,
+) -> torch.Tensor:
+    survival = confidence_probs[idx_mapping].cumprod(dim=1)
+    steps = torch.arange(survival.shape[1], device=survival.device)
+    survival = survival.masked_fill(steps >= capacities[:, None], -float("inf"))
+    admitted = torch.zeros(survival.numel(), dtype=torch.bool, device=survival.device)
+    admitted[survival.flatten().topk(draft_budget).indices] = True
+    return admitted.view_as(survival).sum(dim=1, dtype=torch.int32)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize("num_steps", [3, 8])
+@pytest.mark.parametrize(
+    ("max_num_reqs", "num_reqs"), [(8, 2), (8, 8), (512, 1), (512, 2), (512, 300)]
+)
+def test_draft_budget_kernel_matches_global_topk(num_steps, max_num_reqs, num_reqs):
+    """With distinct survivals the per-request admits equal a global top-k."""
+    gen = torch.Generator(device="cuda").manual_seed(num_reqs * num_steps)
+    confidence_probs = torch.rand(max_num_reqs, num_steps, device="cuda", generator=gen)
+    idx_mapping = torch.randperm(max_num_reqs, device="cuda", generator=gen)
+    idx_mapping = idx_mapping[:num_reqs]
+    scheduled = torch.randint(
+        1, num_steps + 1, (num_reqs,), dtype=torch.int32, device="cuda", generator=gen
+    )
+    scheduled[0] = num_steps
+    survival = torch.empty(max_num_reqs * num_steps, dtype=torch.int32, device="cuda")
+    num_scheduled = int(scheduled.sum())
+    # The caller only invokes the kernel when the budget binds.
+    budgets = {1, num_scheduled // 2, num_scheduled - 1}
+    for draft_budget in sorted(b for b in budgets if 0 < b < num_scheduled):
+        capacities = scheduled.clone()
+        assign_draft_token_budget(
+            confidence_probs, idx_mapping, capacities, draft_budget, survival
+        )
+        expected = global_topk_budget(
+            confidence_probs, idx_mapping, scheduled, draft_budget
+        )
+        assert torch.equal(capacities, expected)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    ("num_reqs", "num_steps", "budget"), [(8, 5, 16), (300, 3, 800)]
+)
+def test_draft_budget_kernel_admits_exact_budget_on_ties(num_reqs, num_steps, budget):
+    """Tied survivals are handed out in request order on both selection paths."""
+    confidence_probs = torch.ones(num_reqs, num_steps, device="cuda")
+    idx_mapping = torch.arange(num_reqs, device="cuda")
+    capacities = torch.full((num_reqs,), num_steps, dtype=torch.int32, device="cuda")
+    survival = torch.empty(num_reqs * num_steps, dtype=torch.int32, device="cuda")
+    assign_draft_token_budget(
+        confidence_probs, idx_mapping, capacities, budget, survival
+    )
+    assert capacities.tolist() == [
+        min(num_steps, max(0, budget - row * num_steps)) for row in range(num_reqs)
+    ]
 
 
 def test_zero_budget_keeps_one_grammar_row_per_scheduled_draft():
